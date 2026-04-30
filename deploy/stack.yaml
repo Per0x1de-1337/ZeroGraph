@@ -1,0 +1,17 @@
+# Run from repository root:
+#   docker compose -f deploy/stack.yaml up -d --build
+
+services:
+  zg-runtime:
+    build:
+      context: ..
+      dockerfile: deploy/runtime/Dockerfile
+    image: zg-runtime:latest
+    container_name: zg-runtime
+    ports:
+      - "13371-13870:13371-13870"
+    volumes:
+      - ../workspace:/var/zerograph/ws
+    environment:
+      ZG_WORKSPACE: /var/zerograph/ws
+    restart: unless-stopped
