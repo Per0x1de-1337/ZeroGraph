@@ -1,0 +1,283 @@
+import json
+import logging
+import re
+import threading
+import time
+from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+
+from ..models import QueryResult
+from ..exceptions import QueryExecutionError
+from ..telemetry import get_tracer
+from .engine_pool import EnginePool
+
+if TYPE_CHECKING:
+    from .engine_rpc import EngineRpc
+    from zerograph.runtime.catalog import Catalog
+
+logger = logging.getLogger(__name__)
+tracer = get_tracer()
+
+# Dataflow queries (reachableByFlows) return huge result sets and run for minutes.
+# Auto-cap their output and give them a higher default timeout.
+_DATAFLOW_PATTERNS = (".reachableByFlows", "reachableByFlows")
+_DATAFLOW_RESULT_LIMIT = 50
+_DATAFLOW_DEFAULT_TIMEOUT = 120  # seconds
+
+
+class GraphRunner:
+    """Service for executing graph query queries against CPGs native HTTP server"""
+
+    def __init__(
+        self,
+        engine_pool: Optional["EnginePool"] = None,
+        config: Optional[Dict[str, Any]] = None,
+        codebase_tracker: Optional["Catalog"] = None,
+    ):
+        self.engine_pool = engine_pool
+        self.config = config or {}
+        self.codebase_tracker = codebase_tracker
+        # Serialize queries per codebase so a runaway query on one JVM doesn't
+        # cause a second thread to pile on and also burn a worker slot.
+        self._codebase_locks: Dict[str, threading.Semaphore] = {}
+        self._locks_mutex = threading.Lock()
+
+    def _get_codebase_lock(self, codebase_hash: str) -> threading.Semaphore:
+        with self._locks_mutex:
+            if codebase_hash not in self._codebase_locks:
+                self._codebase_locks[codebase_hash] = threading.Semaphore(1)
+            return self._codebase_locks[codebase_hash]
+
+    def execute_query(
+        self,
+        codebase_hash: str,
+        cpg_path: str,
+        query: str,
+        timeout: int = 30,
+        limit: Optional[int] = None,
+    ) -> QueryResult:
+        """Execute a graph query query using the analysis engine for the specific codebase"""
+        with tracer.start_as_current_span("query.execute") as span:
+            span.set_attribute("query.codebase_hash", codebase_hash)
+            span.set_attribute("query.length", len(query))
+
+            start_time = time.time()
+
+            try:
+                logger.debug(f"Executing query for codebase {codebase_hash}: {query[:100]}...")
+
+                if not self.engine_pool:
+                    return QueryResult(
+                        success=False,
+                        error="No analysis engine manager configured",
+                        error_code="SERVER_UNAVAILABLE",
+                        execution_time=time.time() - start_time,
+                    )
+
+                # Serialize queries per codebase: one JVM handles one query at a time.
+                lock = self._get_codebase_lock(codebase_hash)
+                with lock:
+                    port = self.engine_pool.get_server_port(codebase_hash)
+                    if not port:
+                        # Auto-wake sleeping codebase
+                        if self.codebase_tracker:
+                            info = self.codebase_tracker.get_codebase(codebase_hash)
+                            if info and info.metadata.get("status") == "sleeping" and info.cpg_path:
+                                logger.info(f"Auto-waking sleeping codebase {codebase_hash}")
+                                try:
+                                    port = self.engine_pool.reactivate(codebase_hash, info.cpg_path)
+                                except Exception as e:
+                                    return QueryResult(
+                                        success=False,
+                                        error=f"Failed to reactivate sleeping codebase: {e}",
+                                        error_code="SERVER_UNAVAILABLE",
+                                        execution_time=time.time() - start_time,
+                                    )
+                    if not port:
+                        return QueryResult(
+                            success=False,
+                            error=f"No analysis engine running for codebase {codebase_hash}",
+                            error_code="SERVER_UNAVAILABLE",
+                            execution_time=time.time() - start_time,
+                        )
+
+                    engine_rpc = self.engine_pool.get_or_create_client(codebase_hash)
+
+                    # Single health check — no sleep. If the server was killed due to a
+                    # previous query timeout it will be absent; auto-wake handles restart
+                    # on the next call.
+                    if not engine_rpc.check_health(timeout=10):
+                        logger.warning(f"analysis engine on port {port} not responding")
+                        return QueryResult(
+                            success=False,
+                            error=(
+                                f"analysis engine not responding (port {port}). "
+                                f"It may be restarting after a previous timeout. Try again shortly."
+                            ),
+                            error_code="SERVER_UNAVAILABLE",
+                            execution_time=time.time() - start_time,
+                        )
+
+                    normalized_query = self._normalize_query(query, limit)
+                    logger.debug(f"Normalized query for execution: {normalized_query}")
+
+                    result = self._execute_via_client(engine_rpc, normalized_query, timeout)
+                    result.execution_time = time.time() - start_time
+                    span.set_attribute("query.execution_time_s", result.execution_time)
+                    span.set_attribute("query.success", result.success)
+
+                    # On timeout: kill the server so the runaway JVM doesn't peg CPU.
+                    # Mark it sleeping so the next query auto-reactivates transparently.
+                    if result.error_code == "TIMEOUT":
+                        logger.warning(
+                            f"Query timed out for {codebase_hash} — terminating server "
+                            f"to stop runaway JVM (same pattern as load_cpg timeout)"
+                        )
+                        self.engine_pool.terminate_server(codebase_hash)
+                        if self.codebase_tracker:
+                            try:
+                                self.codebase_tracker.update_codebase(
+                                    codebase_hash,
+                                    engine_port=None,
+                                    metadata={"status": "sleeping"},
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to mark codebase sleeping after timeout: {e}")
+
+                    return result
+
+            except Exception as e:
+                execution_time = time.time() - start_time
+                logger.error(f"Error executing query: {e}", exc_info=True)
+                return QueryResult(
+                    success=False,
+                    error=str(e),
+                    execution_time=execution_time,
+                )
+
+    def _normalize_query(self, query: str, limit: Optional[int] = None) -> str:
+        """Normalize query to ensure proper output format"""
+        query = query.strip()
+
+        # Check if this is a block query that already produces its own output
+        # Block queries start with { and end with }
+        if query.startswith('{') and query.endswith('}'):
+            # Check if the block contains JSON output methods
+            if '.toJsonPretty' in query or '.toJson' in query:
+                # Block already produces JSON, don't modify
+                return query
+            # Check if the block returns a string (.toString() at the end)
+            if '.toString()' in query[-50:]:
+                # Block returns a string, don't add JSON conversion
+                return query
+
+        # Remove existing output modifiers from the end
+        if query.endswith('.toJsonPretty'):
+            base_query = query[:-13]
+        elif query.endswith('.toJson'):
+            base_query = query[:-7]
+        elif query.endswith('.l'):
+            base_query = query[:-2]
+        elif query.endswith('.toList'):
+            base_query = query[:-7]
+        else:
+            base_query = query
+
+        # Auto-cap dataflow queries that are not already limited — they fan out over the
+        # entire identifier set and return enormous result sets if unconstrained.
+        is_size_query = bool(re.search(r"\.size\s*$", base_query))
+        if limit is None and any(p in base_query for p in _DATAFLOW_PATTERNS):
+            limit = _DATAFLOW_RESULT_LIMIT
+        if limit is not None and limit > 0 and not is_size_query:
+            base_query = f"{base_query}.take({limit})"
+
+        # Add JSON output or string conversion for size results
+        if is_size_query:
+            return f"{base_query}.toString"
+        return f"{base_query}.toJsonPretty"
+
+    def _execute_via_client(self, engine_rpc: 'EngineRpc', query: str, timeout: int) -> QueryResult:
+        """Execute query using analysis engine client"""
+        try:
+            logger.debug(f"Executing query via engine client: {query[:100]}...")
+
+            result = engine_rpc.execute_query(query, timeout=timeout)
+
+            if result.get("success"):
+                stdout = result.get("stdout", "")
+                data = self._parse_output(stdout)
+                row_count = len(data) if isinstance(data, list) else 1
+                return QueryResult(success=True, data=data, row_count=row_count)
+            else:
+                stderr = result.get("stderr", "")
+                if "timeout" in stderr.lower() or "timed out" in stderr.lower():
+                    error_msg = (
+                        f"Query timed out after {timeout}s. "
+                        f"Try: 1) filtering by filename, "
+                        f"2) increasing the timeout parameter, "
+                        f"3) using simpler queries before taint analysis."
+                    )
+                    logger.error(f"Query execution timed out after {timeout}s: {query[:100]}...")
+                    return QueryResult(success=False, error=error_msg, error_code="TIMEOUT")
+                logger.error(f"Query execution failed: {stderr}")
+                return QueryResult(success=False, error=stderr, error_code="QUERY_ERROR")
+
+        except Exception as e:
+            logger.error(f"Error executing query via engine client: {e}")
+            return QueryResult(success=False, error=str(e), error_code="QUERY_ERROR")
+
+    def _parse_output(self, output: str) -> Union[list, int, float, str]:
+        """Parse graph query output"""
+        if not output or not output.strip():
+            return []
+
+        # Remove ANSI color codes
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        output = ansi_escape.sub('', output)
+
+        # First, check for zerograph_result markers (for text output queries)
+        marker_match = re.search(r'<zerograph_result>\s*(.*?)\s*</zerograph_result>', output, re.DOTALL)
+        if marker_match:
+            # Return the extracted content as a string in a list
+            return [marker_match.group(1).strip()]
+
+        # Try to extract JSON from Scala REPL output
+        # Look for JSON within triple quotes
+        match = re.search(r'"""(\[.*?\]|\{.*?\})"""', output, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+            try:
+                data = json.loads(json_str)
+                if isinstance(data, dict):
+                    return [data]
+                elif isinstance(data, list):
+                    return data
+                else:
+                    return [{"value": str(data)}]
+            except json.JSONDecodeError:
+                pass
+
+        # Try direct JSON parsing
+        try:
+            data = json.loads(output)
+            if isinstance(data, dict):
+                return [data]
+            elif isinstance(data, list):
+                return data
+            else:
+                return [{"value": str(data)}]
+        except json.JSONDecodeError:
+            # Return as plain text
+            # If output looks like a simple number, return as primitive
+            s = output.strip()
+            # Try int
+            try:
+                return int(s)
+            except Exception:
+                pass
+            # Try float
+            try:
+                return float(s)
+            except Exception:
+                pass
+            # If not numeric, return as string
+            return s
