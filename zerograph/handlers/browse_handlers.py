@@ -1,0 +1,1604 @@
+"""
+Code Browsing MCP Tools for ZeroGraph Server
+Tools for exploring and navigating codebase structure
+"""
+
+import logging
+import os
+import re
+from typing import Any, Dict, Optional, Annotated
+from pydantic import Field
+
+from ..exceptions import (
+            ValidationError,
+)
+from zerograph.lib.query_rendering import escape_scala_string
+from zerograph.lib.validators import validate_codebase_hash
+from zerograph.templates.loader import QueryLoader
+
+logger = logging.getLogger(__name__)
+
+
+def _get_workspace_path() -> str:
+    from zerograph.paths import WORKSPACE_ROOT
+    return str(WORKSPACE_ROOT)
+
+
+def _get_source_snapshot_dir(codebase_hash: str) -> str:
+    from zerograph.paths import host_repos
+    source_dir = str(host_repos(codebase_hash))
+    if not os.path.isdir(source_dir):
+        raise ValidationError(
+            "Codebase source snapshot is unavailable. Regenerate the CPG to restore it."
+        )
+    return source_dir
+
+
+def register_browse_handlers(mcp, services: dict):
+    """Register code browsing MCP tools with the FastMCP server"""
+
+
+    @mcp.tool(
+        description="""List methods/functions in the codebase.
+
+Discover all methods and functions defined in the analyzed code.
+
+Args:
+    codebase_hash: The codebase hash.
+    name_pattern: Regex filter for method name.
+    file_pattern: Regex filter for filename.
+    callee_pattern: Regex filter for methods that call this specific function.
+    include_external: Include external (library) methods (default False).
+    limit: Max results.
+    page: Page number.
+
+Returns:
+    {
+        "success": true,
+        "methods": [{"name": "main", "filename": "main.c", ...}],
+        "total": 100,
+        "page": 1,
+        "total_pages": 5
+    }
+
+Notes:
+    - Use name_pattern to find specific methods.
+    - Use callee_pattern to find usages (e.g., who calls 'malloc').
+
+Examples:
+    zg_list_symbols(codebase_hash="abc", name_pattern=".*auth.*")
+    zg_list_symbols(codebase_hash="abc", callee_pattern="memcpy")""",
+    )
+    def zg_list_symbols(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        name_pattern: Annotated[Optional[str], Field(description="Optional regex to filter method names (e.g., '.*authenticate.*')")] = None,
+        file_pattern: Annotated[Optional[str], Field(description="Optional regex to filter by file path")] = None,
+        callee_pattern: Annotated[Optional[str], Field(description="Optional regex to filter for methods that call a specific function (e.g., 'memcpy|free|malloc')")] = None,
+        include_external: Annotated[bool, Field(description="Include external/library methods")] = False,
+        limit: Annotated[int, Field(description="Maximum number of results to fetch for caching")] = 1000,
+        page: Annotated[int, Field(description="Page number")] = 1,
+        page_size: Annotated[int, Field(description="Number of results per page")] = 100,
+    ) -> Dict[str, Any]:
+        """Discover all methods and functions defined in the codebase."""
+        try:
+            code_browsing_service = services["code_browsing_service"]
+            return code_browsing_service.zg_list_symbols(
+                codebase_hash=codebase_hash,
+                name_pattern=name_pattern,
+                file_pattern=file_pattern,
+                callee_pattern=callee_pattern,
+                include_external=include_external,
+                limit=limit,
+                page=page,
+                page_size=page_size,
+            )
+        except ValidationError as e:
+            logger.error(f"Error listing methods: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    @mcp.tool(
+        description="""List source files in the codebase as a tree structure with pagination.
+
+Args:
+    codebase_hash: The codebase hash.
+    local_path: Optional relative path to list from.
+    page: Page number (default 1).
+    page_size: Number of files per page (default 100).
+
+Returns:
+    A text-based tree representation of the file structure:
+    
+    project/
+    ├── src/
+    │   ├── main.c
+    │   └── utils.c
+    └── README.md
+    
+    --- Page 1/3 | Showing 100 of 250 items ---
+    (Use page=2 to see more)
+
+Notes:
+    - Returns plain text tree, NOT JSON.
+    - The .git folder is automatically excluded.
+    - Default limit is 100 files per page.
+
+Examples:
+    zg_list_files(codebase_hash="abc")
+    zg_list_files(codebase_hash="abc", local_path="src/lib")
+    zg_list_files(codebase_hash="abc", page=2)""",
+    )
+    def zg_list_files(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        local_path: Annotated[Optional[str], Field(description="Optional path inside the codebase to list (relative to source root or absolute).")] = None,
+        page: Annotated[int, Field(description="Page number (1-indexed)")] = 1,
+        page_size: Annotated[int, Field(description="Number of files per page (default 100)")] = 100,
+    ) -> str:
+        """Get all source files as a tree structure with pagination.
+        
+        Returns:
+            str: A text-based tree representation of the file structure.
+        """
+        try:
+            code_browsing_service = services["code_browsing_service"]
+            return code_browsing_service.zg_list_files(
+                codebase_hash=codebase_hash,
+                local_path=local_path,
+                page=page,
+                page_size=page_size,
+            )
+        except ValidationError as e:
+            logger.error(f"Error listing files: {e}")
+            return f"Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return f"Internal Error: {str(e)}"
+
+
+    @mcp.tool(
+        description="""Get the source code of a specific method.
+
+Retrieve the actual source code for a method to understand its implementation.
+
+Args:
+    codebase_hash: The codebase hash.
+    method_name: Exact name or regex for method.
+    filename: Optional filename to disambiguate (relative to project root).
+
+Returns:
+    {
+        "success": true,
+        "methods": [
+            {
+                "name": "main",
+                "filename": "main.c",
+                "lineNumber": 10,
+                "lineNumberEnd": 20,
+                "code": "int main() { ... }"
+            }
+        ]
+    }
+
+Notes:
+    - Returns list in case multiple methods match the pattern.
+    - filename should be relative to the project root (e.g., 'src/main.c' not '/absolute/path/src/main.c').
+
+Examples:
+    zg_symbol_source(codebase_hash="abc", method_name="main")
+    zg_symbol_source(codebase_hash="abc", method_name="init", filename="driver.c")""",
+    )
+    def zg_symbol_source(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        method_name: Annotated[str, Field(description="Name of the method (can be regex pattern)")],
+        filename: Annotated[Optional[str], Field(description="Optional filename to disambiguate methods with same name")] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve the full source code of a method by name."""
+        try:
+            validate_codebase_hash(codebase_hash)
+
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            # Build query to get method metadata
+            query_parts = [f'cpg.method.name("{escape_scala_string(method_name)}")']
+
+            if filename:
+                query_parts.append(f'.filename(".*{escape_scala_string(filename)}.*")')
+
+            query_parts.append(
+                ".map(m => (m.name, m.filename, m.lineNumber.getOrElse(-1), m.lineNumberEnd.getOrElse(-1)))"
+            )
+            query = "".join(query_parts) + ".toJsonPretty"
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=30,
+                limit=10,
+            )
+
+            if not result.success:
+                return {
+                    "success": False,
+                    "error": result.error,
+                }
+
+            methods = []
+
+            source_dir = _get_source_snapshot_dir(codebase_hash)
+
+            for item in result.data:
+                if not isinstance(item, dict):
+                    continue
+
+                method_name_result = item.get("_1", "")
+                method_filename = item.get("_2", "")
+                line_number = item.get("_3", -1)
+                line_number_end = item.get("_4", -1)
+
+                # Get the full source code using file reading logic
+                if method_filename and line_number > 0 and line_number_end > 0:
+                    try:
+                        # Prevent path traversal
+                        file_path = os.path.realpath(os.path.join(source_dir, method_filename))
+                        real_source_dir = os.path.realpath(source_dir)
+                        if not file_path.startswith(real_source_dir + os.sep):
+                            full_code = f"// Path traversal denied: {method_filename}"
+                            methods.append({
+                                "name": method_name_result,
+                                "filename": method_filename,
+                                "lineNumber": line_number,
+                                "lineNumberEnd": line_number_end,
+                                "code": full_code,
+                            })
+                            continue
+
+                        if os.path.exists(file_path) and os.path.isfile(file_path):
+                            with open(
+                                file_path, "r", encoding="utf-8", errors="replace"
+                            ) as f:
+                                lines = f.readlines()
+
+                            total_lines = len(lines)
+                            if (
+                                line_number <= total_lines
+                                and line_number_end >= line_number
+                            ):
+                                actual_end_line = min(line_number_end, total_lines)
+                                code_lines = lines[line_number - 1: actual_end_line]
+                                full_code = "".join(code_lines)
+                            else:
+                                full_code = f"// Invalid line range: {line_number}-{line_number_end}, file has {total_lines} lines"
+                        else:
+                            full_code = f"// Source file not found: {method_filename}"
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to read source file for method %s in %s: %s",
+                            method_name_result,
+                            method_filename,
+                            e,
+                        )
+                        full_code = "// Error reading source file"
+                else:
+                    full_code = "// Unable to determine line range for method"
+
+                methods.append(
+                    {
+                        "name": method_name_result,
+                        "filename": method_filename,
+                        "lineNumber": line_number,
+                        "lineNumberEnd": line_number_end,
+                        "code": full_code,
+                    }
+                )
+
+            return {"success": True, "methods": methods, "total": len(methods)}
+
+        except ValidationError as e:
+            logger.error(f"Error getting method source: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    @mcp.tool(
+        description="""List function/method calls in the codebase.
+
+Discover call relationships between functions.
+
+Args:
+    codebase_hash: The codebase hash.
+    caller_pattern: Regex for the calling method.
+    callee_pattern: Regex for the called method.
+    limit: Max results.
+    page: Page number.
+
+Returns:
+    {
+        "success": true,
+        "calls": [
+            {"caller": "main", "callee": "printf", "fileName": "main.c", "lineNumber": 10}
+        ],
+        "total": 1
+    }
+
+Notes:
+    - Useful for finding where specific functions are used.
+
+Examples:
+    zg_list_invocations(codebase_hash="abc", callee_pattern="strcpy")
+    zg_list_invocations(codebase_hash="abc", caller_pattern="main")""",
+    )
+    def zg_list_invocations(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        caller_pattern: Annotated[Optional[str], Field(description="Optional regex to filter caller method names")] = None,
+        callee_pattern: Annotated[Optional[str], Field(description="Optional regex to filter callee method names")] = None,
+        limit: Annotated[int, Field(description="Maximum number of results to fetch for caching")] = 1000,
+        page: Annotated[int, Field(description="Page number")] = 1,
+        page_size: Annotated[int, Field(description="Number of results per page")] = 100,
+    ) -> Dict[str, Any]:
+        """Find function call relationships in the codebase."""
+        try:
+            code_browsing_service = services["code_browsing_service"]
+            return code_browsing_service.zg_list_invocations(
+                codebase_hash=codebase_hash,
+                caller_pattern=caller_pattern,
+                callee_pattern=callee_pattern,
+                limit=limit,
+                page=page,
+                page_size=page_size,
+            )
+        except ValidationError as e:
+            logger.error(f"Error listing calls: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+
+    @mcp.tool(
+        description="""Get the call graph for a specific method.
+
+Understand what functions a method calls (outgoing) or what functions
+call it (incoming).
+
+Args:
+    codebase_hash: The codebase hash.
+    method_name: Name of the method to analyze.
+    depth: Traversal depth (default 5).
+    direction: 'outgoing' (callees) or 'incoming' (callers).
+
+Returns:
+    A human-readable text summary:
+    
+    Call Graph for main (outgoing)
+    ============================================================
+    Root: main at main.c:10
+    
+    [DEPTH 1]
+      main → init (config.c:25)
+      main → process (core.c:50)
+    
+    [DEPTH 2]
+      init → load_config (config.c:100)
+      process → validate (core.c:120)
+    
+    Total: 4 edges
+
+Notes:
+    - Essential for impact analysis and understanding code dependencies.
+    - Returns plain text.
+    - Includes file and line number for each call target.
+    - Line numbers refer to where the caller function starts, not the specific call site.
+
+Examples:
+    zg_invocation_tree(codebase_hash="abc", method_name="main", direction="outgoing")
+    zg_invocation_tree(codebase_hash="abc", method_name="vuln_func", direction="incoming")""",
+    )
+    def zg_invocation_tree(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        method_name: Annotated[str, Field(description="Name of the method to analyze (can be regex)")],
+        depth: Annotated[int, Field(description="How many levels deep to traverse (max recommended: 10)")] = 5,
+        direction: Annotated[str, Field(description="Either 'outgoing' (callees) or 'incoming' (callers)")] = "outgoing",
+    ) -> str:
+        """Build the call graph showing callers or callees for a method."""
+        try:
+            validate_codebase_hash(codebase_hash)
+
+            if depth < 1 or depth > 15:
+                raise ValidationError("Depth must be between 1 and 15")
+
+            if direction not in ["outgoing", "incoming"]:
+                raise ValidationError("Direction must be 'outgoing' or 'incoming'")
+
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            # Load query from external file
+            query = QueryLoader.load(
+                "call_graph",
+                method_name=method_name,
+                depth=depth,
+                direction=direction
+            )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=120,
+                limit=500,
+            )
+
+            if not result.success:
+                return f"Error: {result.error}"
+
+            # Query now returns human-readable text directly
+            if isinstance(result.data, str):
+                return result.data.strip()
+            elif isinstance(result.data, list) and len(result.data) > 0:
+                # Extract string from list wrapper
+                output = result.data[0] if isinstance(result.data[0], str) else str(result.data[0])
+                return output.strip()
+            else:
+                return f"Query returned unexpected format: {type(result.data)}"
+
+        except ValidationError as e:
+            logger.error(f"Error getting call graph: {e}")
+            return f"Validation Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return f"Internal Error: {str(e)}"
+
+
+    @mcp.tool(
+        description="""List parameters of a specific method.
+
+Get detailed information about method parameters including their names,
+types, and order.
+
+Args:
+    codebase_hash: The codebase hash.
+    method_name: Method name pattern.
+
+Returns:
+    {
+        "success": true,
+        "methods": [
+            {
+                "method": "authenticate",
+                "parameters": [
+                    {"name": "username", "type": "string", "index": 1},
+                    {"name": "password", "type": "string", "index": 2}
+                ]
+            }
+        ]
+    }
+
+Notes:
+    - Useful for understanding function signatures.
+
+Examples:
+    zg_symbol_params(codebase_hash="abc", method_name="login")""",
+    )
+    def zg_symbol_params(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        method_name: Annotated[str, Field(description="Name of the method (can be regex pattern)")],
+    ) -> Dict[str, Any]:
+        """Get parameter names, types, and order for a method."""
+        try:
+            code_browsing_service = services["code_browsing_service"]
+            return code_browsing_service.zg_symbol_params(
+                codebase_hash=codebase_hash,
+                method_name=method_name,
+            )
+        except ValidationError as e:
+            logger.error(f"Error listing parameters: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+
+    @mcp.tool(
+        description="""Get a high-level summary of the codebase structure.
+
+Provides an overview including file count, method count, language,
+and other metadata.
+
+Args:
+    codebase_hash: The codebase hash.
+
+Returns:
+    {
+        "success": true,
+        "summary": {
+            "language": "C",
+            "total_files": 15,
+            "total_methods": 127
+            "lines_of_code": 5432
+        }
+    }
+
+Notes:
+    - Useful as a first step when exploring a new codebase.
+
+Examples:
+    zg_project_stats(codebase_hash="abc")""",
+    )
+    def zg_project_stats(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")]
+    ) -> Dict[str, Any]:
+        """Get file count, method count, and other high-level metrics."""
+        try:
+            validate_codebase_hash(codebase_hash)
+
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            # Robust query to get all stats in one go
+            stats_query = """
+            {
+                val numFiles = cpg.file.size
+                val numMethods = cpg.method.size
+                val numMethodsUser = cpg.method.isExternal(false).size
+                val numCalls = cpg.call.size
+                val numLiterals = cpg.literal.size
+                val language = cpg.metaData.language.headOption.getOrElse("unknown")
+                
+                Map(
+                    "success" -> true,
+                    "language" -> language,
+                    "total_files" -> numFiles,
+                    "total_methods" -> numMethods,
+                    "user_defined_methods" -> numMethodsUser,
+                    "total_calls" -> numCalls,
+                    "total_literals" -> numLiterals
+                ).toJsonPretty
+            }
+            """
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=stats_query,
+                timeout=30,
+                limit=1,
+            )
+
+            if not result.success:
+                logger.error(f"Query failed: {result.error}")
+                return {
+                    "success": False,
+                    "error": result.error
+                }
+
+            import json
+            summary = {
+                "language": "unknown",
+                "total_files": 0,
+                "total_methods": 0,
+                "user_defined_methods": 0,
+                "external_methods": 0,
+                "total_calls": 0,
+                "total_literals": 0,
+            }
+
+            try:
+                # result.data can be:
+                # 1. List of single-key dicts (Scala Map.toJsonPretty format): [{"key1": val1}, {"key2": val2}, ...]
+                # 2. List containing a single dict with all keys (expected format)
+                # 3. List containing a JSON string (to be parsed)
+                if result.data and isinstance(result.data, list) and len(result.data) > 0:
+                    data = {}
+                    
+                    # Check if it's a list of single-key dicts (Scala Map format)
+                    if all(isinstance(item, dict) and len(item) == 1 for item in result.data):
+                        # Merge all single-key dicts into one
+                        for item in result.data:
+                            data.update(item)
+                        logger.debug(f"Merged Scala Map format data: {data}")
+                    else:
+                        # First element is either a dict or a JSON string
+                        raw_data = result.data[0]
+                        if isinstance(raw_data, str):
+                            data = json.loads(raw_data)
+                        elif isinstance(raw_data, dict):
+                            data = raw_data
+                        else:
+                            data = {}
+                    
+                    # Extract data based on the format
+                    if "_1" in data:
+                        # Mock format: {"_1": language, "_2": 5, "_3": 10, ...}
+                        summary["language"] = data.get("_1", "unknown")
+                        summary["total_files"] = data.get("_2", 0)
+                        summary["total_methods"] = data.get("_3", 0)
+                        summary["user_defined_methods"] = data.get("_4", 0)
+                        summary["total_calls"] = data.get("_5", 0)
+                        summary["total_literals"] = data.get("_6", 0)
+                        summary["external_methods"] = (
+                            summary["total_methods"] - summary["user_defined_methods"]
+                        )
+                    else:
+                        # CPG/Scala format with named keys
+                        summary["language"] = data.get("language", "unknown")
+                        summary["total_files"] = data.get("total_files", 0)
+                        summary["total_methods"] = data.get("total_methods", 0)
+                        summary["user_defined_methods"] = data.get("user_defined_methods", 0)
+                        summary["total_calls"] = data.get("total_calls", 0)
+                        summary["total_literals"] = data.get("total_literals", 0)
+                        summary["external_methods"] = (
+                            summary["total_methods"] - summary["user_defined_methods"]
+                        )
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse summary JSON: {e}")
+                return {
+                    "success": False,
+                    "error": f"Failed to parse result: {str(e)}"
+                }
+            except Exception as e:
+                logger.error(f"Error processing summary data: {e}")
+                # Return partial summary instead of failing completely
+
+            return {"success": True, "summary": summary}
+
+        except ValidationError as e:
+            logger.error(f"Error getting codebase summary: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    @mcp.tool(
+        description="""Retrieve a code snippet from a specific file with line range.
+
+Get the source code from a file between specified start and end line numbers.
+
+Args:
+    codebase_hash: The codebase hash.
+    filename: Relative path to source file (relative to project root).
+    start_line: Start line (1-indexed).
+    end_line: End line (1-indexed).
+
+Returns:
+    {
+        "success": true,
+        "filename": "main.c",
+        "start_line": 10,
+        "end_line": 20,
+        "code": "example code here"
+    }
+
+Notes:
+    - Useful for examining specific parts of the codebase.
+    - filename should be relative to the project root (e.g., 'src/main.c' not '/absolute/path/src/main.c').
+
+Examples:
+    zg_file_range(codebase_hash="abc", filename="main.c", start_line=10, end_line=20)""",
+    )
+    def zg_file_range(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        filename: Annotated[str, Field(description="Name of the file to retrieve code from (relative to source root)")],
+        start_line: Annotated[int, Field(description="Starting line number (1-indexed)")],
+        end_line: Annotated[int, Field(description="Ending line number (1-indexed, inclusive)")],
+    ) -> Dict[str, Any]:
+        """Read specific lines from a source file."""
+        try:
+            validate_codebase_hash(codebase_hash)
+
+            if start_line < 1 or end_line < start_line:
+                raise ValidationError(
+                    "Invalid line range: start_line must be >= 1 and end_line >= start_line"
+                )
+
+            codebase_tracker = services["codebase_tracker"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            source_dir = _get_source_snapshot_dir(codebase_hash)
+
+            # Construct full file path and prevent path traversal
+            file_path = os.path.realpath(os.path.join(source_dir, filename))
+            real_source_dir = os.path.realpath(source_dir)
+            if not file_path.startswith(real_source_dir + os.sep):
+                raise ValidationError(
+                    f"Path traversal denied: '{filename}' resolves outside source directory"
+                )
+
+            # Check if file exists
+            if not os.path.exists(file_path):
+                raise ValidationError(
+                    f"File '{filename}' not found in source directory"
+                )
+
+            if not os.path.isfile(file_path):
+                raise ValidationError(f"'{filename}' is not a file")
+
+            # Read the file
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+
+            # Validate line numbers
+            total_lines = len(lines)
+            if start_line > total_lines:
+                raise ValidationError(
+                    f"start_line {start_line} exceeds file length {total_lines}"
+                )
+
+            if end_line > total_lines:
+                end_line = total_lines
+
+            # Extract the code snippet (lines are 0-indexed in the list)
+            code_lines = lines[start_line - 1: end_line]
+            code = "".join(code_lines)
+
+            return {
+                "success": True,
+                "filename": filename,
+                "start_line": start_line,
+                "end_line": end_line,
+                "code": code,
+            }
+
+        except ValidationError as e:
+            logger.error(f"Error getting code snippet: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": "Failed to read source file",
+            }
+    @mcp.tool(
+        description="""Execute a raw graph query against the codebase.
+
+Run arbitrary queries over the code property graph for advanced analysis.
+
+Args:
+    codebase_hash: The codebase hash.
+    query: The graph query string.
+    timeout: Optional execution timeout.
+    validate: Validate syntax before execution (default False).
+
+Returns:
+    {
+        "success": true,
+        "stdout": "raw output",
+        "stderr": "error output"
+    }
+
+Notes:
+    - Power user tool. Requires knowledge of graph query language.
+    - Use zg_graph_script_docs for reference.
+
+Examples:
+    zg_run_graph_script(codebase_hash="abc", query="cpg.method.name.l")""",
+    )
+    def zg_run_graph_script(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        query: Annotated[str, Field(description="The graph query string to execute")],
+        timeout: Annotated[Optional[int], Field(description="Optional timeout in seconds")] = None,
+        validate: Annotated[bool, Field(description="If true, validate query syntax before executing")] = False,
+    ) -> Dict[str, Any]:
+        """Run a raw graph query for custom CPG analysis."""
+        try:
+            from zerograph.lib.graph_query_validator import GraphQueryValidator, QueryTransformer
+            import time
+            from zerograph.runtime.engine_rpc import EngineRpc
+            
+            validate_codebase_hash(codebase_hash)
+
+            if not query or not query.strip():
+                raise ValidationError("Query cannot be empty")
+
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            # Validate query if requested
+            validation_result = None
+            if validate:
+                validation_result = GraphQueryValidator.validate_query(query.strip())
+                if not validation_result['valid'] and validation_result['errors']:
+                    return {
+                        "success": False,
+                        "validation": validation_result,
+                        "error": "Query validation failed",
+                    }
+
+            # Dataflow queries (reachableByFlows) legitimately need more time.
+            # Use a higher default when the caller didn't specify an explicit timeout.
+            from zerograph.runtime.query_executor import _DATAFLOW_PATTERNS, _DATAFLOW_DEFAULT_TIMEOUT
+            _effective_timeout = timeout
+            if _effective_timeout is None:
+                _effective_timeout = (
+                    _DATAFLOW_DEFAULT_TIMEOUT
+                    if any(p in query for p in _DATAFLOW_PATTERNS)
+                    else 30
+                )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query.strip(),
+                timeout=_effective_timeout,
+                limit=None,
+            )
+
+            response = {
+                "success": result.success,
+                "data": result.data,
+                "row_count": result.row_count,
+                "execution_time": getattr(result, "execution_time", None),
+            }
+
+            if not result.success and getattr(result, "error", None):
+                response["error"] = result.error
+            if not result.success and getattr(result, "error_code", None):
+                response["error_code"] = result.error_code
+
+            # If validation was requested, include it in response
+            if validate and validation_result:
+                response["validation"] = validation_result
+
+            # If query failed, try to provide helpful suggestions from stderr (if available)
+            if not response["success"] and result.error:
+                error_suggestion = GraphQueryValidator.get_error_suggestion(result.error)
+                if error_suggestion:
+                    response["suggestion"] = error_suggestion
+                    response["help"] = {
+                        "description": error_suggestion.get("description"),
+                        "solution": error_suggestion.get("solution"),
+                        "examples": error_suggestion.get("examples", [])[:3],
+                    }
+            return response
+
+        except ValidationError as e:
+            logger.error(f"Error executing graph query: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error executing graph query: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    @mcp.tool(
+        description="""Find bounds checks near buffer access.
+
+Verify if buffer accesses have corresponding bounds checks by analyzing
+comparison operations involving the index variable.
+
+Args:
+    codebase_hash: The codebase hash.
+    buffer_access_location: 'filename:line' of the access (e.g., 'buf[i] = x').
+
+Returns:
+    A human-readable text summary of the bounds check analysis.
+
+Notes:
+    - Helps identify potential buffer overflow vulnerabilities.
+    - Checks for missing bounds checks or checks that happen too late.
+    - filename in buffer_access_location should be relative to the project root (e.g., 'src/parser.c:100').
+
+Examples:
+    zg_scan_bounds_guard(codebase_hash="abc", buffer_access_location="parser.c:3393")""",
+    )
+    def zg_scan_bounds_guard(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        buffer_access_location: Annotated[str, Field(description="Location of buffer access in format 'filename:line' (e.g., 'parser.c:3393')")],
+    ) -> str:
+        """Check if buffer accesses have proper bounds validation."""
+        try:
+            validate_codebase_hash(codebase_hash)
+
+            # Parse the buffer access location
+            if ":" not in buffer_access_location:
+                raise ValidationError(
+                    "buffer_access_location must be in format 'filename:line'"
+                )
+
+            filename, line_str = buffer_access_location.rsplit(":", 1)
+            try:
+                line_num = int(line_str)
+            except ValueError:
+                raise ValidationError(f"Invalid line number: {line_str}")
+
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}. Generate it first using zg_index_repo.")
+
+            # Load query from external file
+            query = QueryLoader.load(
+                "bounds_checks",
+                filename=filename,
+                line_num=line_num
+            )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=30,
+            )
+
+            if result.success and result.data:
+                # result.data is typically a list of results from the query
+                # for text queries, it's a list containing the text with <zerograph_result> tags
+                output = result.data[0] if isinstance(result.data, list) else str(result.data)
+                return output.strip()
+            else:
+                return f"Error: {result.error if not result.success else 'No data returned'}"
+
+        except ValidationError as e:
+            logger.error(f"Error finding bounds checks: {e}")
+            return f"Validation Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}", exc_info=True)
+            return f"Internal Error: {str(e)}"
+
+    @mcp.tool(
+        description="""Get comprehensive graph query syntax help and examples.
+
+Provides syntax documentation, common patterns, node types, and error solutions.
+
+Args:
+    None.
+
+Returns:
+    {
+        "success": true,
+        "syntax_helpers": {...},
+        "error_guide": {...},
+        "quick_reference": {...}
+    }
+
+Notes:
+    - Use this to learn how to write queries for zg_run_graph_script.
+
+Examples:
+    zg_graph_script_docs()""",
+    )
+    def zg_graph_script_docs() -> Dict[str, Any]:
+        """Get graph query syntax documentation and common query patterns."""
+        try:
+            from zerograph.lib.graph_query_validator import GraphQueryValidator
+            
+            helpers = GraphQueryValidator.get_syntax_helpers()
+            
+            return {
+                "success": True,
+                "syntax_helpers": helpers,
+                "error_guide": {
+                    "common_errors": [
+                        {
+                            "error": "matches is not a member of Iterator[String]",
+                            "cause": "Trying to call .matches() directly on a stream",
+                            "solution": "Use .filter() with lambda: .filter(_.property.matches(\"regex\"))",
+                            "examples": [
+                                "cpg.method.filter(_.name.matches(\"process.*\")).l",
+                                "cpg.call.filter(_.code.matches(\".*malloc.*\")).l",
+                            ]
+                        },
+                        {
+                            "error": "value contains is not a member",
+                            "cause": "Substring matching syntax error",
+                            "solution": "Use inside filter lambda: .filter(_.property.contains(\"text\"))",
+                            "examples": [
+                                "cpg.literal.filter(_.code.contains(\"password\")).l",
+                                "cpg.call.filter(_.code.contains(\"system\")).l",
+                            ]
+                        },
+                        {
+                            "error": "not found: value _",
+                            "cause": "Lambda syntax error or invalid property access",
+                            "solution": "Ensure lambda uses underscore: _ (not $, @, or other symbols)",
+                            "examples": [
+                                "cpg.method.filter(_.name.nonEmpty).l",
+                                "cpg.call.where(_.method.name != \"\").l",
+                            ]
+                        },
+                        {
+                            "error": "Unmatched closing parenthesis",
+                            "cause": "Syntax error - mismatched parentheses",
+                            "solution": "Count opening and closing parentheses - they must match",
+                            "examples": [
+                                "cpg.method.filter(_.name.matches(\"test.*\")).l",
+                            ]
+                        },
+                    ],
+                    "tips": [
+                        "Always use .l or .toJsonPretty at the end to get results",
+                        "Use .filter(_) or .where(_) with underscore lambda for conditions",
+                        "String literals in filter need quotes: filter(_.name == \"value\")",
+                        "Regex patterns must be in quotes and escaped: \".*pattern.*\"",
+                        "For better performance, filter before calling .l",
+                    ]
+                },
+                "quick_reference": {
+                    "string_methods": {
+                        "exact_match": '.name("exactString")',
+                        "regex_match": '.filter(_.name.matches("regex.*"))',
+                        "substring_match": '.filter(_.code.contains("substring"))',
+                        "case_insensitive": '.filter(_.name.toLowerCase.matches("pattern.*"))',
+                        "not_empty": '.filter(_.name.nonEmpty)',
+                        "equals": '.filter(_.name == "value")',
+                        "not_equals": '.filter(_.name != "value")',
+                    },
+                    "common_node_properties": {
+                        "method": ["name", "filename", "signature", "lineNumber", "isExternal"],
+                        "call": ["name", "code", "filename", "lineNumber"],
+                        "literal": ["code", "typeFullName", "filename", "lineNumber"],
+                        "parameter": ["name", "typeFullName", "index"],
+                        "file": ["name", "hash"],
+                    },
+                    "result_formatting": {
+                        "json_pretty": '.toJsonPretty  # Pretty-printed JSON',
+                        "json_compact": '.toJson  # Compact JSON',
+                        "list": '.l  # Scala list (automatically formatted)',
+                        "count": '.size  # Get count as number',
+                        "single_item": '.head  # Get first result',
+                        "optional": '.headOption  # Get optional first result',
+                    }
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error getting graph query syntax help: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    # ============================================================================
+    # SEMANTIC ANALYSIS TOOLS
+    # ============================================================================
+
+    @mcp.tool(
+        description="""Get control flow graph (CFG) for a method.
+
+Understand the control flow of a method with a human-readable graph.
+
+Args:
+    codebase_hash: The codebase hash.
+    method_name: Name of the method.
+    max_nodes: Limit nodes returned (default 100).
+
+Returns:
+    A human-readable text graph:
+    
+    Control Flow Graph for main
+    ============================================================
+    Nodes:
+      [1001] ControlStructure: if (x > 0)
+      [1002] Return: return x
+    
+    Edges:
+      [1001] -> [1002] [Label: TRUE]
+
+Notes:
+    - Essential for understanding loops, conditions, and execution paths.
+    - Returns plain text.
+
+Examples:
+    zg_control_flow(codebase_hash="abc", method_name="main")""",
+    )
+    def zg_control_flow(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        method_name: Annotated[str, Field(description="Name of the method (can be regex pattern)")],
+        max_nodes: Annotated[int, Field(description="Maximum CFG nodes to return (for large methods)")] = 100,
+    ) -> str:
+        """Get nodes and edges representing control flow in a method."""
+        try:
+            validate_codebase_hash(codebase_hash)
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}")
+
+            # Load query from external file
+            query = QueryLoader.load(
+                "cfg",
+                method_name=method_name,
+                max_nodes=max_nodes
+            )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=30,
+                limit=max_nodes,
+            )
+
+            if not result.success:
+                return f"Error: {result.error}"
+
+            # Query now returns human-readable text directly
+            if isinstance(result.data, str):
+                return result.data.strip()
+            elif isinstance(result.data, list) and len(result.data) > 0:
+                # Extract string from list wrapper
+                output = result.data[0] if isinstance(result.data[0], str) else str(result.data[0])
+                return output.strip()
+            else:
+                return f"Query returned unexpected format: {type(result.data)}"
+
+        except ValidationError as e:
+            logger.error(f"Error getting CFG: {e}")
+            return f"Validation Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error getting CFG: {e}", exc_info=True)
+            return f"Internal Error: {str(e)}"
+
+
+    @mcp.tool(
+        description="""Get type/struct definition with members.
+
+Inspect struct or class memory layouts.
+
+Args:
+    codebase_hash: The codebase hash.
+    type_name: Regex for type name.
+    limit: Max results.
+
+Returns:
+    {
+        "success": true,
+        "types": [
+            {
+                "name": "UserStruct",
+                "members": [{"name": "id", "type": "int"}, {"name": "buf", "type": "char*"}]
+            }
+        ]
+    }
+
+Notes:
+    - Essential for understanding buffer sizes and memory layouts.
+    - Does not read header files; uses CPG type info.
+
+Examples:
+    zg_type_layout(codebase_hash="abc", type_name=".*request_t.*")""",
+    )
+    def zg_type_layout(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        type_name: Annotated[str, Field(description="Type name pattern (regex, e.g., '.*Buffer.*')")],
+        limit: Annotated[int, Field(description="Maximum types to return")] = 10,
+    ) -> Dict[str, Any]:
+        """Get struct/class definition with member names and types."""
+        try:
+            validate_codebase_hash(codebase_hash)
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}")
+
+            # Load query from external file
+            query = QueryLoader.load(
+                "type_definition",
+                type_name=type_name,
+                limit=limit
+            )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=30,
+                limit=limit,
+            )
+
+            if not result.success:
+                return {
+                    "success": False,
+                    "error": result.error,
+                }
+
+            types = []
+            if result.data:
+                for item in result.data:
+                    if isinstance(item, dict):
+                        types.append({
+                            "name": item.get("_1"),
+                            "fullName": item.get("_2"),
+                            "filename": item.get("_3"),
+                            "lineNumber": item.get("_4"),
+                            "members": item.get("_5", []),
+                        })
+
+            return {
+                "success": True,
+                "types": types,
+                "total": len(types),
+            }
+
+        except ValidationError as e:
+            logger.error(f"Error getting type definition: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error getting type definition: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+
+    @mcp.tool(
+        description="""Check if calls at a location might be macro expansions.
+
+Detects potential macros using heuristics (naming conventions, dispatch type).
+
+Args:
+    codebase_hash: The codebase hash.
+    filename: Filename (partial, relative to project root).
+    line_number: Optional line number.
+
+Returns:
+    {
+        "success": true,
+        "calls": [
+            {"name": "COPY_BUF", "is_macro": true, "macro_hints": ["ALL_CAPS"]}
+        ]
+    }
+
+Notes:
+    - Heuristic only (NOT definitive).
+    - C/C++ macros are expanded before the CPG is built.
+    - filename should be relative to the project root (e.g., 'src/main.c').
+
+Examples:
+    zg_macro_hints(codebase_hash="abc", filename="main.c", line_number=42)""",
+    )
+    def zg_macro_hints(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        filename: Annotated[str, Field(description="Filename to search (partial match)")],
+        line_number: Annotated[Optional[int], Field(description="Optional line number to filter")] = None,
+    ) -> Dict[str, Any]:
+        """Detect potential macro expansions using naming heuristics."""
+        try:
+            validate_codebase_hash(codebase_hash)
+            codebase_tracker = services["codebase_tracker"]
+            query_executor = services["query_executor"]
+
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info or not codebase_info.cpg_path:
+                raise ValidationError(f"CPG not found for codebase {codebase_hash}")
+
+            # Load query from external file
+            line_filter = f".lineNumber({line_number})" if line_number else ""
+            query = QueryLoader.load(
+                "macro_expansion",
+                filename=filename,
+                line_filter=line_filter
+            )
+
+            result = query_executor.execute_query(
+                codebase_hash=codebase_hash,
+                cpg_path=codebase_info.cpg_path,
+                query=query,
+                timeout=30,
+                limit=50,
+            )
+
+            if not result.success:
+                return {
+                    "success": False,
+                    "error": result.error,
+                }
+
+            # Deduplicate by name - keep first occurrence of each unique name
+            seen_names = set()
+            calls = []
+            if result.data:
+                for item in result.data:
+                    if isinstance(item, dict):
+                        name = item.get("_1", "")
+                        
+                        # Skip if already seen this name (deduplication)
+                        if name in seen_names:
+                            continue
+                        seen_names.add(name)
+                        
+                        dispatch = item.get("_5", "")
+                        
+                        # Multiple heuristics for macro detection
+                        hints = []
+                        is_inlined = dispatch == "INLINED"
+                        # ALL_CAPS: uppercase letters and underscores only, length > 1, not operators
+                        is_all_caps = (
+                            len(name) > 1 and 
+                            all(c.isupper() or c == '_' for c in name) and
+                            not name.startswith("<operator>")
+                        )
+                        
+                        if is_inlined:
+                            hints.append("INLINED_DISPATCH")
+                        if is_all_caps:
+                            hints.append("ALL_CAPS_NAME")
+                        
+                        calls.append({
+                            "name": name,
+                            "code": item.get("_2"),
+                            "lineNumber": item.get("_3"),
+                            "filename": item.get("_4"),
+                            "dispatch_type": dispatch,
+                            "is_macro": len(hints) > 0,
+                            "macro_hints": hints,
+                        })
+
+            return {
+                "success": True,
+                "calls": calls,
+                "total": len(calls),
+                "unique_names": len(seen_names),
+                "note": "Heuristic detection only. Macros are expanded before CPG analysis.",
+            }
+
+        except ValidationError as e:
+            logger.error(f"Error getting macro expansion: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+        except Exception as e:
+            logger.error(f"Unexpected error getting macro expansion: {e}", exc_info=True)
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    # Default vulnerability patterns for commit message analysis
+    DEFAULT_VULN_PATTERNS = [
+        r"CVE-\d{4}-\d+",  # CVE identifiers
+        r"\bfix(ed|es|ing)?\b.*\b(vuln|secur|overflow|injection|xss|csrf|sqli|leak|exploit)\b",
+        r"\b(buffer|heap|stack|integer)\s*(overflow|underflow)\b",
+        r"\buse[- ]?after[- ]?free\b",
+        r"\bdouble[- ]?free\b",
+        r"\b(format\s*)?string\s*vuln",
+        r"\bpatch(ed|es|ing)?\b.*\b(vuln|secur|bug)\b",
+        r"\bsecurity\s*(fix|patch|update|issue)\b",
+        r"\bmemory\s*(corrupt|leak|safety)\b",
+        r"\bout[- ]?of[- ]?bounds\b",
+        r"\bnull[- ]?pointer\b",
+        r"\brace\s*condition\b",
+        r"\bdenial[- ]?of[- ]?service\b",
+        r"\bdos\s*(attack|vuln)\b",
+    ]
+
+    @mcp.tool(
+        description="""Discover potential vulnerability fixes from git commit history.
+
+OPTIONAL reconnaissance tool to identify commits that may have fixed security issues.
+Use this to discover attack surface hints based on past vulnerability patterns.
+
+Args:
+    codebase_hash: The codebase hash.
+    limit: Maximum commits to analyze (default 500).
+    patterns: Optional custom regex patterns to match (uses defaults if not provided).
+
+Returns:
+    Human-readable text summarizing discovered vulnerability-related commits:
+    
+    Discovered Vulnerability Fixes
+    ============================================================
+    Found 3 commits mentioning security fixes
+    
+    [1] abc1234 - Fix buffer overflow in parse_input
+        Matched: buffer overflow
+        Files: src/parser.c, include/parser.h
+    
+    [2] def5678 - CVE-2023-1234: Patch XSS in template
+        Matched: CVE-2023-1234
+        Files: templates/render.py
+
+Notes:
+    - This is a DISCOVERY tool, not a vulnerability scanner.
+    - Results are hints for further investigation, not confirmed vulnerabilities.
+    - Works on git repositories only.
+    - For comprehensive security analysis, use taint analysis and other CPG tools.
+
+Examples:
+    zg_audit_git_history(codebase_hash="abc")
+    zg_audit_git_history(codebase_hash="abc", limit=100)""",
+    )
+    def zg_audit_git_history(
+        codebase_hash: Annotated[str, Field(description="The codebase hash from zg_index_repo")],
+        limit: Annotated[int, Field(description="Maximum number of commits to analyze")] = 500,
+        patterns: Annotated[Optional[list], Field(description="Optional list of custom regex patterns to match")] = None,
+    ) -> str:
+        """Discover vulnerability-related commits from git history."""
+        try:
+            import git
+
+            validate_codebase_hash(codebase_hash)
+
+            codebase_tracker = services["codebase_tracker"]
+
+            # Verify CPG exists for this codebase
+            codebase_info = codebase_tracker.get_codebase(codebase_hash)
+            if not codebase_info:
+                raise ValidationError(f"Codebase {codebase_hash} not found. Generate it first using zg_index_repo.")
+
+            source_dir = _get_source_snapshot_dir(codebase_hash)
+
+            # Check if it's a git repository
+            git_dir = os.path.join(source_dir, ".git")
+            if not os.path.exists(git_dir):
+                return "Error: Source directory is not a git repository. This tool requires git history."
+
+            # Open the repository
+            try:
+                repo = git.Repo(source_dir)
+            except git.InvalidGitRepositoryError:
+                return "Error: Invalid git repository. Cannot analyze commit history."
+
+            # Use provided patterns or defaults
+            vuln_patterns = patterns if patterns else DEFAULT_VULN_PATTERNS
+            compiled_patterns = []
+            for pattern in vuln_patterns:
+                try:
+                    compiled_patterns.append((pattern, re.compile(pattern, re.IGNORECASE)))
+                except re.error as e:
+                    logger.warning(f"Invalid regex pattern '{pattern}': {e}")
+
+            if not compiled_patterns:
+                return "Error: No valid regex patterns to match against."
+
+            # Analyze commits
+            discoveries = []
+            commits_analyzed = 0
+
+            try:
+                for commit in repo.iter_commits(max_count=limit):
+                    commits_analyzed += 1
+                    message = commit.message.strip()
+                    
+                    # Check each pattern
+                    matched_patterns = []
+                    for pattern_str, pattern_re in compiled_patterns:
+                        match = pattern_re.search(message)
+                        if match:
+                            matched_patterns.append(match.group(0))
+
+                    if matched_patterns:
+                        # Get files changed in this commit
+                        try:
+                            if commit.parents:
+                                diff = commit.parents[0].diff(commit)
+                                files_changed = list(set(
+                                    d.a_path if d.a_path else d.b_path 
+                                    for d in diff 
+                                    if d.a_path or d.b_path
+                                ))
+                            else:
+                                # Initial commit - list all files
+                                files_changed = [item.path for item in commit.tree.traverse() if item.type == 'blob']
+                        except Exception as e:
+                            logger.debug(f"Could not get diff for commit {commit.hexsha[:7]}: {e}")
+                            files_changed = []
+
+                        # Get first line of commit message for display
+                        first_line = message.split('\n')[0][:80]
+                        if len(message.split('\n')[0]) > 80:
+                            first_line += "..."
+
+                        discoveries.append({
+                            "sha": commit.hexsha[:7],
+                            "message": first_line,
+                            "matched": matched_patterns,
+                            "files": files_changed[:20],  # Limit files shown
+                            "total_files": len(files_changed),
+                        })
+
+            except Exception as e:
+                logger.error(f"Error iterating commits: {e}")
+                return f"Error: Failed to analyze git history: {str(e)}"
+
+            # Build output
+            output_lines = [
+                "Discovered Vulnerability Fixes",
+                "=" * 60,
+                f"Analyzed {commits_analyzed} commits, found {len(discoveries)} with security-related messages",
+                "",
+            ]
+
+            if not discoveries:
+                output_lines.append("No commits matching vulnerability patterns were found.")
+                output_lines.append("")
+                output_lines.append("This does not mean the code is vulnerability-free.")
+                output_lines.append("Use CPG-based tools for comprehensive security analysis.")
+            else:
+                for i, disc in enumerate(discoveries, 1):
+                    output_lines.append(f"[{i}] {disc['sha']} - {disc['message']}")
+                    output_lines.append(f"    Matched: {', '.join(disc['matched'])}")
+                    if disc['files']:
+                        files_str = ", ".join(disc['files'][:5])
+                        if disc['total_files'] > 5:
+                            files_str += f" (+{disc['total_files'] - 5} more)"
+                        output_lines.append(f"    Files: {files_str}")
+                    output_lines.append("")
+
+                output_lines.append("-" * 60)
+                output_lines.append("NOTE: These are hints for investigation, not confirmed vulnerabilities.")
+                output_lines.append("Use zg_trace_flows, zg_scan_uaf, etc. to analyze specific locations.")
+
+            return "\n".join(output_lines)
+
+        except ValidationError as e:
+            logger.error(f"Validation error in zg_audit_git_history: {e}")
+            return f"Validation Error: {str(e)}"
+        except Exception as e:
+            logger.error(f"Unexpected error in zg_audit_git_history: {e}", exc_info=True)
+            return f"Internal Error: {str(e)}"
