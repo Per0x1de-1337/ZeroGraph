@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+ZeroGraph Server - Main entry point using FastMCP
+
+This is the main entry point for the ZeroGraph Server that provides static code analysis
+capabilities through the Model Context Protocol (MCP) using native Code Property Graph.
+"""
+
+import asyncio
+import logging
+import os
+import shutil
+import socket
+import time
+from contextlib import suppress
+from datetime import datetime, timezone
+from fastmcp import FastMCP
+from fastmcp.server.lifespan import lifespan
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
+
+from zerograph.config import load_config
+from zerograph import defaults
+from zerograph.paths import GRAPHS_DIR, REPOS_DIR, WORKSPACE_ROOT
+from zerograph.handlers.index_handlers import IndexJobQueue
+from zerograph.runtime import (
+    Catalog,
+    RepoSync,
+    GraphBuilder,
+    EnginePool,
+    PortRegistry,
+    GraphRunner,
+    Explorer,
+)
+from zerograph.lib import DBManager, setup_logging
+from zerograph.handlers import register_tools
+
+# Version information - bump this when releasing new versions
+VERSION = "0.3.4-beta"
+
+# Global service instances
+services = {}
+
+# Set when the lifespan starts — used for uptime calculation
+_server_start_time: float = 0.0
+
+logger = logging.getLogger(__name__)
+
+
+def _setup_telemetry(config) -> None:
+    """Configure OpenTelemetry SDK if telemetry is enabled.
+
+    Must be called before FastMCP tools are invoked so the tracer provider
+    is in place when FastMCP's built-in instrumentation fires.
+    """
+    telemetry = config.telemetry
+    if not telemetry.enabled:
+        logger.debug("Telemetry disabled, skipping OpenTelemetry setup")
+        return
+
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.resources import Resource
+
+        resource = Resource.create({"service.name": telemetry.service_name})
+        provider = TracerProvider(resource=resource)
+
+        if telemetry.otlp_protocol == "grpc":
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        else:
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        exporter = OTLPSpanExporter(endpoint=telemetry.otlp_endpoint)
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+        trace.set_tracer_provider(provider)
+
+        logger.info(f"OpenTelemetry enabled: exporting to {telemetry.otlp_endpoint} via {telemetry.otlp_protocol}")
+    except ImportError:
+        logger.warning("OpenTelemetry packages not installed. Install with: pip install opentelemetry-sdk opentelemetry-exporter-otlp")
+    except Exception as e:
+        logger.warning(f"Failed to initialize OpenTelemetry: {e}")
+
+
+async def _graceful_shutdown():
+    """Gracefully shutdown all services"""
+    logger.info("Performing graceful shutdown...")
+
+    try:
+        status_log_task = services.get('status_log_task')
+        if status_log_task:
+            status_log_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await status_log_task
+
+        # Terminate all analysis engines
+        engine_pool = services.get('engine_pool')
+        if engine_pool:
+            watchdog_task = getattr(engine_pool, '_watchdog_task', None)
+            if watchdog_task:
+                watchdog_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watchdog_task
+
+            logger.info("Terminating all analysis engines...")
+            engine_pool.terminate_all_servers()
+            logger.info("All analysis engines terminated")
+
+        # Release all ports
+        if 'port_manager' in services:
+            logger.info("Releasing allocated ports...")
+            try:
+                services['port_manager'].release_all_ports()
+            except Exception as e:
+                logger.warning(f"Error releasing ports: {e}")
+
+        # Stop CPG generation queue
+        if 'cpg_queue' in services:
+            await services['cpg_queue'].stop()
+
+        restart_tasks = services.get('restart_tasks', {})
+        for task in restart_tasks.values():
+            task.cancel()
+        for task in restart_tasks.values():
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Flush database and caches
+        if 'db_manager' in services:
+            logger.info("Flushing database...")
+            try:
+                services['db_manager'].close()
+            except Exception as e:
+                logger.warning(f"Error closing database: {e}")
+
+        logger.info("Graceful shutdown completed")
+    except Exception as e:
+        logger.error(f"Error during graceful shutdown: {e}", exc_info=True)
+    finally:
+        services.clear()
+
+
+def _check_engine_container_status(container_name: str | None = None, engine_manager=None) -> dict:
+    """Inspect the Analysis engine Docker container without raising on Docker issues."""
+    container_name = container_name or services.get("engine_container_name") or os.getenv(
+        "ENGINE_CONTAINER_NAME", "zg-runtime"
+    )
+
+    try:
+        import docker
+
+        docker_client = None
+        if engine_manager is not None:
+            docker_client = getattr(engine_manager, "docker_client", None)
+        if docker_client is None:
+            docker_client = docker.from_env()
+
+        container = docker_client.containers.get(container_name)
+        status = getattr(container, "status", "unknown")
+        return {
+            "container_name": container_name,
+            "running": status == "running",
+            "status": status,
+        }
+    except ImportError as e:
+        return {
+            "container_name": container_name,
+            "running": False,
+            "status": "docker_unavailable",
+            "error": str(e),
+        }
+    except docker.errors.NotFound:
+        return {
+            "container_name": container_name,
+            "running": False,
+            "status": "not_found",
+        }
+    except docker.errors.DockerException as e:
+        return {
+            "container_name": container_name,
+            "running": False,
+            "status": "docker_unavailable",
+            "error": str(e),
+        }
+    except Exception as e:
+        return {
+            "container_name": container_name,
+            "running": False,
+            "status": "error",
+            "error": str(e),
+        }
+
+
+def _describe_engine_container_issue(container_info: dict) -> str | None:
+    """Return a user-facing issue string for the current analysis engine container state."""
+    status = container_info.get("status")
+    container_name = container_info.get("container_name", "zg-runtime")
+
+    if status == "running":
+        return None
+    if status == "not_found":
+        return f"Analysis engine Docker container '{container_name}' not found"
+    if status == "docker_unavailable":
+        return f"Cannot connect to Docker daemon: {container_info.get('error', 'Docker unavailable')}"
+    if status == "error":
+        return f"Failed to inspect Analysis engine Docker container '{container_name}': {container_info.get('error', 'unknown error')}"
+    return f"Analysis engine Docker container '{container_name}' is not running"
+
+
+def _get_active_servers() -> dict:
+    """Return the active analysis engine map and count."""
+    engine_manager = services.get("engine_pool")
+    if not engine_manager:
+        return {"count": 0, "servers": {}}
+
+    try:
+        servers = engine_manager.get_running_servers()
+        return {"count": len(servers), "servers": servers}
+    except Exception as e:
+        return {"count": 0, "servers": {}, "error": str(e)}
+
+
+def _get_port_utilization() -> dict:
+    """Return current engine port allocation counts."""
+    port_manager = services.get("port_manager")
+    if not port_manager:
+        return {"allocated_count": 0, "available_count": 0}
+
+    try:
+        return {
+            "allocated_count": len(port_manager.get_all_allocations()),
+            "available_count": port_manager.available_count(),
+        }
+    except Exception as e:
+        return {"allocated_count": 0, "available_count": 0, "error": str(e)}
+
+
+def _get_cache_size() -> dict:
+    """Return basic information about the CPG cache on disk."""
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    cache_path = str(GRAPHS_DIR)
+    return {
+        "cache_path": cache_path,
+        "size_mb": _get_cpg_cache_mb(),
+        "exists": os.path.exists(cache_path),
+    }
+
+
+@lifespan
+async def app_lifespan(server: FastMCP):
+    """Startup and shutdown logic for the FastMCP server"""
+    global _server_start_time
+    services.clear()
+    _server_start_time = time.monotonic()
+
+    # Load configuration
+    config = load_config("config.yaml")
+    setup_logging(config.server.log_level)
+    logger.info("Starting ZeroGraph Server")
+
+    # Setup OpenTelemetry (must happen before tool invocations)
+    _setup_telemetry(config)
+
+    # Ensure required directories exist
+    os.makedirs(config.storage.workspace_root, exist_ok=True)
+
+    # Create workspace directory relative to project root
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    workspace_dir = str(WORKSPACE_ROOT)
+    cpgs_dir = str(GRAPHS_DIR)
+    codebases_dir = str(REPOS_DIR)
+
+    os.makedirs(cpgs_dir, exist_ok=True)
+    os.makedirs(codebases_dir, exist_ok=True)
+    logger.info("Created required directories")
+
+    try:
+        # Initialize DB Manager
+        db_manager = DBManager(os.path.join(project_root, "zerograph.db"))
+
+        logger.info("DB Manager initialized")
+
+        # Initialize services
+        services['config'] = config
+        services['db_manager'] = db_manager
+        services['startup_issues'] = []
+        services['codebase_tracker'] = Catalog(db_manager)
+        services['git_manager'] = RepoSync(config.storage.workspace_root)
+
+        # Initialize port manager for analysis engines
+        services['port_manager'] = PortRegistry(
+            port_min=config.engine.port_min,
+            port_max=config.engine.port_max
+        )
+
+        container_name = os.getenv("ENGINE_CONTAINER_NAME", "zg-runtime")
+        services['engine_container_name'] = container_name
+
+        engine_pool = None
+        container_status = _check_engine_container_status(container_name)
+        container_issue = _describe_engine_container_issue(container_status)
+
+        if container_status.get("running"):
+            try:
+                engine_pool = EnginePool(
+                    engine_binary_path=config.engine.binary_path,
+                    container_name=container_name,
+                    config=config,
+                    codebase_tracker=services['codebase_tracker'],
+                    max_active_servers=config.engine.max_active_servers,
+                )
+                logger.info(f"Docker container '{container_name}' is running")
+            except Exception as e:
+                container_issue = f"Failed to initialize analysis engine manager: {e}"
+                services['startup_issues'].append(container_issue)
+                logger.warning(container_issue)
+        else:
+            if container_issue:
+                services['startup_issues'].append(container_issue)
+                logger.warning(
+                    f"{container_issue}. Engine-backed tools will be unavailable until Docker is ready."
+                )
+
+        services['engine_pool'] = engine_pool
+
+        # Initialize CPG generator (runs CPG toolchain directly in container)
+        services['cpg_generator'] = GraphBuilder(config=config, engine_pool=engine_pool)
+        # Skip initialize() - no Docker needed
+
+        # Initialize query executor with analysis engine manager
+        services['query_executor'] = GraphRunner(
+            engine_pool,
+            config=config.query,
+            codebase_tracker=services['codebase_tracker'],
+        )
+
+        # Initialize Code Browsing Service
+        services['code_browsing_service'] = Explorer(
+            services['codebase_tracker'],
+            services['query_executor'],
+            services['db_manager']
+        )
+
+        # Start CPG generation queue (B3)
+        cpg_queue = IndexJobQueue(workers=config.cpg.build_workers)
+        await cpg_queue.start()
+        services['cpg_queue'] = cpg_queue
+        logger.info(f"CPG generation queue started with {config.cpg.build_workers} workers")
+
+        # Register MCP tools now that services are initialized
+        register_tools(server, services)
+
+        # Start engine watchdog (C1) — must run after tools are registered
+        if engine_pool:
+            engine_pool.start_watchdog()
+            logger.info("analysis engine watchdog started")
+
+        # Periodic status logger
+        interval = int(os.getenv("STATUS_LOG_INTERVAL_SECS", "60"))
+        services['status_log_task'] = asyncio.create_task(_periodic_status_log(interval))
+
+        logger.info("All services initialized")
+        logger.info("ZeroGraph Server is ready")
+
+        yield services
+
+    except Exception as e:
+        logger.error(f"Error during server lifecycle: {e}", exc_info=True)
+        raise
+    finally:
+        await _graceful_shutdown()
+        logger.info("ZeroGraph Server shutdown complete")
+
+
+def _apply_transforms(server) -> None:
+    """Apply CodeMode transform after all tools are registered.
+
+    CodeMode replaces the full 34-tool catalog with three lightweight
+    discovery tools + one execute tool, so the LLM only loads schemas
+    for the tools it actually needs:
+
+        ListTools   — enumerate every available tool by name (one-shot)
+        Search      — natural-language search across tool descriptions
+        GetSchemas  — fetch full parameter schemas for selected tools
+        execute     — run a Python script that chains call_tool() calls
+                      in a sandbox, eliminating sequential round-trips
+    """
+    from fastmcp.experimental.transforms.code_mode import (
+        CodeMode, ListTools, Search, GetSchemas,
+    )
+    server.add_transform(CodeMode(
+        discovery_tools=[ListTools(), Search(), GetSchemas()],
+    ))
+    logger.info("Transform: CodeMode enabled (ListTools + Search + GetSchemas)")
+
+
+class ConcurrencyLimitMiddleware(BaseHTTPMiddleware):
+    """Return 503 when too many MCP connections are active (B2)."""
+
+    def __init__(self, app, max_concurrent: int = 8):
+        super().__init__(app)
+        self._sem = asyncio.Semaphore(max_concurrent)
+
+    async def dispatch(self, request: Request, call_next):
+        if self._sem.locked():
+            return PlainTextResponse(
+                "Server busy - too many concurrent requests",
+                status_code=503,
+                headers={"Retry-After": "5"},
+            )
+        async with self._sem:
+            return await call_next(request)
+
+
+# Initialize FastMCP server
+_max_mcp = int(os.getenv("MAX_MCP_CONNECTIONS", str(defaults.MAX_MCP_CONNECTIONS)))
+mcp = FastMCP(
+    "ZeroGraph Server",
+    lifespan=app_lifespan,
+)
+# Note: Tools are registered inside the lifespan function
+# register_tools(mcp, services)
+# TODO: _apply_transforms is experimental — call it manually to enable CodeMode
+
+
+def _uptime_seconds() -> float:
+    return round(time.monotonic() - _server_start_time, 1) if _server_start_time else 0.0
+
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    days, s = divmod(s, 86400)
+    hours, s = divmod(s, 3600)
+    minutes, s = divmod(s, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
+
+
+def _get_process_memory_mb() -> float:
+    try:
+        import psutil
+        return round(psutil.Process().memory_info().rss / (1024 ** 2), 1)
+    except ImportError:
+        pass
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return round(kb / 1024, 1)
+    except Exception:
+        pass
+    return -1.0
+
+
+def _get_system_memory_available_gb() -> float:
+    try:
+        import psutil
+        return round(psutil.virtual_memory().available / (1024 ** 3), 2)
+    except ImportError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return round(kb / (1024 ** 2), 2)
+    except Exception:
+        pass
+    return -1.0
+
+
+def _get_disk_usage(path: str) -> dict:
+    try:
+        stat = shutil.disk_usage(path)
+        return {
+            "total_gb": round(stat.total / (1024 ** 3), 2),
+            "used_gb": round(stat.used / (1024 ** 3), 2),
+            "free_gb": round(stat.free / (1024 ** 3), 2),
+            "percent_used": round((stat.used / stat.total) * 100, 1) if stat.total > 0 else 0,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _get_cpg_cache_mb() -> float:
+    try:
+        cpgs_dir = str(GRAPHS_DIR)
+        total = 0
+        for dirpath, _, filenames in os.walk(cpgs_dir):
+            for f in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+        return round(total / (1024 ** 2), 2)
+    except Exception:
+        return -1.0
+
+
+def _format_codebase_source(source_type: str, source_path: str, include_sensitive: bool = False) -> str:
+    """Format a codebase source for operator output.
+
+    Health responses default to redacted values so repository locations are not
+    exposed. Internal status logs can opt into the original source path.
+    """
+    if include_sensitive:
+        return source_path
+    return f"<redacted:{source_type or 'unknown'}>"
+
+
+def _get_codebase_list(include_sensitive: bool = False) -> list:
+    try:
+        tracker = services.get("codebase_tracker")
+        engine_mgr = services.get("engine_pool")
+        if not tracker:
+            return []
+        result = []
+        for h in tracker.list_codebases():
+            info = tracker.get_codebase(h)
+            if not info:
+                continue
+            status = info.metadata.get("status", "unknown")
+            port = engine_mgr.get_server_port(h) if engine_mgr else None
+            result.append({
+                "hash": h,
+                "language": info.language,
+                "status": status,
+                "engine_port": port,
+                "source_type": info.source_type,
+                "source": _format_codebase_source(
+                    info.source_type,
+                    info.source_path,
+                    include_sensitive=include_sensitive,
+                ),
+            })
+        return result
+    except Exception:
+        return []
+
+
+def _build_health(include_sensitive: bool = False) -> dict:
+    """Collect all health metrics and return a structured dict."""
+    engine_mgr = services.get("engine_pool")
+    project_root = os.path.dirname(os.path.abspath(__file__))
+
+    # analysis engine container
+    container_info = _check_engine_container_status(services.get("engine_container_name"), engine_mgr)
+
+    # analysis engine pool
+    active_servers_info = _get_active_servers()
+    active_servers = active_servers_info.get("servers", {})
+
+    # Sleeping count
+    sleeping = 0
+    codebases = _get_codebase_list(include_sensitive=include_sensitive)
+    by_status: dict = {}
+    for cb in codebases:
+        s = cb["status"]
+        by_status[s] = by_status.get(s, 0) + 1
+        if s == "sleeping":
+            sleeping += 1
+
+    # Port pool
+    port_usage = _get_port_utilization()
+    port_info = {
+        "allocated": port_usage.get("allocated_count", 0),
+        "available": port_usage.get("available_count", 0),
+    }
+
+    # CPG queue
+    cpq = services.get("cpg_queue")
+    config = services.get("config")
+    cache_info = _get_cache_size()
+
+    issues = list(services.get("startup_issues", []))
+    container_issue = _describe_engine_container_issue(container_info)
+    if container_issue and container_issue not in issues:
+        issues.append(container_issue)
+    if _get_system_memory_available_gb() < 1.0:
+        issues.append("System memory critically low (<1 GB available)")
+
+    uptime = _uptime_seconds()
+    return {
+        "status": "unhealthy" if container_issue else ("degraded" if issues else "healthy"),
+        "issues": issues,
+        "service": "zerograph",
+        "version": VERSION,
+        "uptime": {
+            "seconds": uptime,
+            "human": _format_uptime(uptime),
+        },
+        "engine": {
+            "container": container_info,
+            "servers": {
+                "active": len(active_servers),
+                "sleeping": sleeping,
+                "max_allowed": engine_mgr._max_active if engine_mgr else 0,
+                "lru_evictions": engine_mgr._lru_eviction_count if engine_mgr else 0,
+                "port_pool": port_info,
+            },
+        },
+        "cpg_queue": {
+            "depth": cpq.depth if cpq else 0,
+            "workers": config.cpg.build_workers if config else 0,
+        },
+        "repos": {
+            "total": len(codebases),
+            "by_status": by_status,
+            "list": codebases,
+        },
+        "resources": {
+            "process_memory_mb": _get_process_memory_mb(),
+            "system_memory_available_gb": _get_system_memory_available_gb(),
+            "disk": _get_disk_usage(project_root),
+            "cpg_cache_mb": cache_info.get("size_mb", -1.0),
+        },
+    }
+
+
+async def _periodic_status_log(interval_secs: int) -> None:
+    """Log a compact server status block every interval_secs seconds."""
+    while True:
+        await asyncio.sleep(interval_secs)
+        try:
+            h = _build_health(include_sensitive=True)
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            sep = "=" * 60
+            lines = [
+                sep,
+                f"ZeroGraph Status  [{now}]  uptime {h['uptime']['human']}",
+                sep,
+                f"Status : {h['status'].upper()}" + (f"  issues={h['issues']}" if h['issues'] else ""),
+                f"Memory : process={h['resources']['process_memory_mb']} MB  "
+                f"system_avail={h['resources']['system_memory_available_gb']} GB",
+                f"Engine : active={h['engine']['servers']['active']}  "
+                f"sleeping={h['engine']['servers']['sleeping']}  "
+                f"max={h['engine']['servers']['max_allowed']}  "
+                f"evictions={h['engine']['servers']['lru_evictions']}",
+                f"Queue  : depth={h['cpg_queue']['depth']}  "
+                f"workers={h['cpg_queue']['workers']}",
+                f"CPGs   : {h['repos']['total']} registered  "
+                + "  ".join(f"{k}={v}" for k, v in h['repos']['by_status'].items()),
+            ]
+            for cb in h['repos']['list']:
+                port_str = f":{cb['engine_port']}" if cb['engine_port'] else "      "
+                src = cb['source']
+                if len(src) > 40:
+                    src = "..." + src[-37:]
+                lines.append(
+                    f"  {cb['hash']:<12}  {cb['language']:<10}  {cb['status']:<10}  {port_str:<7}  {src}"
+                )
+            lines.append(sep)
+            for line in lines:
+                logger.info(line)
+        except Exception as e:
+            logger.warning(f"Periodic status log failed: {e}")
+
+
+# Health check endpoint
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    """Health check endpoint"""
+    try:
+        h = _build_health()
+        status_code = 200 if h["status"] != "unhealthy" else 503
+        return JSONResponse(h, status_code=status_code)
+    except Exception as e:
+        logger.error(f"Error in health check: {e}", exc_info=True)
+        return JSONResponse({
+            "status": "unhealthy",
+            "service": "zerograph",
+            "version": VERSION,
+            "error": str(e),
+        }, status_code=500)
+
+
+# Root endpoint
+@mcp.custom_route("/", methods=["GET"])
+async def root(request):
+    """Root endpoint providing basic server information"""
+    return JSONResponse({
+        "service": "zerograph",
+        "description": "ZeroGraph for static code analysis using Code Property Graph technology",
+        "version": VERSION,
+        "endpoints": {
+            "health": "/health",
+            "mcp": "/mcp"
+        }
+    })
+
+
+if __name__ == "__main__":
+    config_data = load_config("config.yaml")
+    host = config_data.server.host
+    port = config_data.server.port
+
+    logger.info(f"Starting ZeroGraph Server with HTTP transport on {host}:{port}")
+
+    _http_middleware = [Middleware(ConcurrencyLimitMiddleware, max_concurrent=_max_mcp)]
+    asyncio.run(mcp.run_http_async(host=host, port=port, middleware=_http_middleware))
