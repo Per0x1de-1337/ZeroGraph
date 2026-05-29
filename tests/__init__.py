@@ -1,1 +1,1 @@
-# Test package for MindGraph
+# Test package for ZeroGraph
