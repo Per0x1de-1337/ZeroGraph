@@ -2,6 +2,33 @@
 
 A containerized Model Context Protocol (MCP) server for static code analysis using Joern's Code Property Graph (CPG). Supports Java, C/C++, JavaScript, Python, Go, Kotlin, C#, Ghidra, Jimple, PHP, Ruby, and Swift.
 
+## Pentest agent — huntr disclosures (duplicates)
+
+The bundled agents surfaced several valid issues in AI/ML upstream projects during
+evaluation. We reported each on [huntr](https://huntr.com); triage marked them
+**duplicate** (see [docs/pentest-findings.md](docs/pentest-findings.md)).
+
+| Target | Issue | Huntr |
+|--------|-------|-------|
+| mlflow/mlflow | Webhook SSRF (CVE-2026-2393) | [bounty](https://huntr.com/bounties/04ef100d-06b5-4a70-95b1-b7be23aa8150) |
+| triton-inference-server/server | `Accept-Encoding` integer overflow DoS | [bounty](https://huntr.com/bounties/541b64b9-6bd2-477d-b9f0-c66575e20848) |
+| apache/airflow | Log symlink arbitrary file read | [bounty](https://huntr.com/bounties/8554ec70-2095-44d7-819c-1f181da22166) |
+| keras-team/keras | Zip slip in `get_file` extract | [bounty](https://huntr.com/bounties/c8bcd0aa-35e6-4d96-a52b-e2bab8958502) |
+| huggingface/transformers | Unsafe `torch.load` (CVE-2026-1839) | [bounty](https://huntr.com/bounties/3c77bb97-e493-493d-9a88-c57f5c536485) |
+
+## Pentest agent — in triage
+
+Additional huntr submissions from agent runs are **in triage**. Per-target write-ups
+under `docs/disclosures/` will be added here as soon as huntr completes review.
+
+| Target | Status |
+|--------|--------|
+| [huggingface/transformers](https://github.com/huggingface/transformers) | In triage — disclosure coming soon |
+| [jupyter/jupyter](https://github.com/jupyter/jupyter) | In triage — disclosure coming soon |
+| [keras-team/keras](https://github.com/keras-team/keras) | In triage — disclosure coming soon |
+| [triton-inference-server/server](https://github.com/triton-inference-server/server) | In triage — disclosure coming soon |
+| [parisneo/lollms](https://github.com/parisneo/lollms) | In triage — disclosure coming soon |
+
 ## Prerequisites
 
 Before you begin, make sure you have:
@@ -356,18 +383,3 @@ OTEL_ENABLED=true python main.py
 | `otlp_protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Export protocol (`grpc` or `http/protobuf`) |
 
 When telemetry is disabled (default), all tracing is no-op with zero overhead.
-
-
-## Pentest agent — huntr disclosures (duplicates)
-
-The bundled agents surfaced several valid issues in AI/ML upstream projects during
-evaluation. We reported each on [huntr](https://huntr.com); triage marked them
-**duplicate** (see [docs/pentest-findings.md](docs/pentest-findings.md)).
-
-| Target | Issue | Huntr |
-|--------|-------|-------|
-| mlflow/mlflow | Webhook SSRF (CVE-2026-2393) | [bounty](https://huntr.com/bounties/04ef100d-06b5-4a70-95b1-b7be23aa8150) |
-| triton-inference-server/server | `Accept-Encoding` integer overflow DoS | [bounty](https://huntr.com/bounties/541b64b9-6bd2-477d-b9f0-c66575e20848) |
-| apache/airflow | Log symlink arbitrary file read | [bounty](https://huntr.com/bounties/8554ec70-2095-44d7-819c-1f181da22166) |
-| keras-team/keras | Zip slip in `get_file` extract | [bounty](https://huntr.com/bounties/c8bcd0aa-35e6-4d96-a52b-e2bab8958502) |
-| huggingface/transformers | Unsafe `torch.load` (CVE-2026-1839) | [bounty](https://huntr.com/bounties/3c77bb97-e493-493d-9a88-c57f5c536485) |
