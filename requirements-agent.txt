@@ -1,0 +1,6 @@
+# Extra dependencies for LLM agents (install on top of requirements.txt)
+langchain>=0.3.0
+langchain-openai>=0.3.0
+langgraph>=0.2.0
+langchain-mcp-adapters>=0.2.0
+openai>=1.82.0
